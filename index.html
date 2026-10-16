@@ -1,0 +1,217 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Consent GPS Tracker</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 600px;
+      margin: 30px auto;
+      padding: 20px;
+      background: #111827;
+      color: white;
+    }
+    input, button {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 13px;
+      margin: 7px 0;
+      border-radius: 8px;
+      border: 1px solid #64748b;
+    }
+    button { cursor: pointer; background: #d4a85b; }
+    input { background: #fff; color: #111; }
+    #map { width: 100%; height: 300px; border: 0; }
+    .panel { background: #1f2937; padding: 16px;
+             border-radius: 12px; margin: 14px 0; }
+  </style>
+</head>
+<body>
+  <h1>GPS Tracker</h1>
+  <p>Location sharing is controlled by the phone owner.</p>
+
+  <div class="panel">
+    <h3>Account</h3>
+    <input id="url" placeholder="Supabase Project URL">
+    <input id="key" placeholder="Supabase publishable key">
+    <input id="email" type="email" placeholder="Email">
+    <input id="password" type="password" placeholder="Password">
+    <button onclick="register()">Create account</button>
+    <button onclick="login()">Log in</button>
+    <button onclick="logout()">Log out</button>
+    <p id="authStatus">Not signed in</p>
+  </div>
+
+  <div class="panel">
+    <h3>Location sharing</h3>
+    <p id="status">Sharing is off.</p>
+    <button onclick="startSharing()">Start Sharing</button>
+    <button onclick="stopSharing()">Stop Sharing</button>
+    <p id="coords">No location received yet.</p>
+    <p id="updated"></p>
+    <iframe id="map" title="Your latest GPS location"
+      hidden loading="lazy"
+      referrerpolicy="no-referrer"
+      src="about:blank"></iframe>
+  </div>
+
+<script>
+let db = null;
+let watchId = null;
+let lastSent = 0;
+let busy = false;
+let currentUser = null;
+let generation = 0;
+
+function setup() {
+  const url = document.getElementById('url').value.trim();
+  const key = document.getElementById('key').value.trim();
+
+  if (!url.startsWith('https://') || !key) {
+    throw new Error('Enter your Supabase URL and publishable key.');
+  }
+
+  if (!db) db = supabase.createClient(url, key);
+  return db;
+}
+
+async function register() {
+  try {
+    const client = setup();
+    const { error } = await client.auth.signUp({
+      email: document.getElementById('email').value.trim(),
+      password: document.getElementById('password').value
+    });
+    if (error) throw error;
+    alert('Check your email if confirmation is enabled.');
+  } catch (e) { alert(e.message); }
+}
+
+async function login() {
+  try {
+    const client = setup();
+    const { data, error } = await client.auth.signInWithPassword({
+      email: document.getElementById('email').value.trim(),
+      password: document.getElementById('password').value
+    });
+    if (error) throw error;
+    currentUser = data.user;
+    document.getElementById('authStatus').textContent =
+      'Signed in: ' + currentUser.email;
+    await loadLatest();
+  } catch (e) { alert(e.message); }
+}
+
+async function logout() {
+  stopSharing();
+  if (db) await db.auth.signOut();
+  currentUser = null;
+  document.getElementById('authStatus').textContent = 'Not signed in';
+}
+
+async function startSharing() {
+  try {
+    setup();
+    if (!currentUser) throw new Error('Log in first.');
+    if (!navigator.geolocation) {
+      throw new Error('This browser does not support GPS.');
+    }
+    if (watchId !== null) return;
+
+    const myGeneration = ++generation;
+    document.getElementById('status').textContent =
+      'Requesting location permission...';
+
+    watchId = navigator.geolocation.watchPosition(
+      async position => {
+        if (myGeneration !== generation || !currentUser) return;
+
+        const now = Date.now();
+        document.getElementById('coords').textContent =
+          position.coords.latitude.toFixed(6) + ', ' +
+          position.coords.longitude.toFixed(6);
+
+        document.getElementById('map').hidden = false;
+        document.getElementById('map').src =
+          'https://www.openstreetmap.org/export/embed.html?marker=' +
+          position.coords.latitude + ',' +
+          position.coords.longitude +
+          '&zoom=16';
+
+        document.getElementById('status').textContent =
+          'Sharing is ON while this page remains active.';
+
+        if (now - lastSent < 10000 || busy) return;
+        lastSent = now;
+        busy = true;
+
+        try {
+          const { error } = await db.from('locations').insert({
+            user_id: currentUser.id,
+            latitude: position.coords.latitude,
+            longitude: position.coords.longitude,
+            accuracy: position.coords.accuracy
+          });
+          if (error) throw error;
+          document.getElementById('updated').textContent =
+            'Last saved: ' + new Date().toLocaleString();
+        } catch (e) {
+          document.getElementById('status').textContent =
+            'Save failed: ' + e.message;
+        } finally {
+          busy = false;
+        }
+      },
+      error => {
+        document.getElementById('status').textContent =
+          'Location error: ' + error.message;
+        stopSharing();
+      },
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 }
+    );
+  } catch (e) {
+    alert(e.message);
+  }
+}
+
+function stopSharing() {
+  generation++;
+  if (watchId !== null && navigator.geolocation) {
+    navigator.geolocation.clearWatch(watchId);
+  }
+  watchId = null;
+  busy = false;
+  document.getElementById('status').textContent = 'Sharing is OFF.';
+}
+
+async function loadLatest() {
+  if (!db || !currentUser) return;
+  const { data, error } = await db.from('locations')
+    .select('latitude,longitude,accuracy,recorded_at')
+    .order('recorded_at', { ascending: false })
+    .limit(1);
+
+  if (error) {
+    document.getElementById('status').textContent = error.message;
+    return;
+  }
+  if (!data || !data.length) return;
+
+  const p = data[0];
+  document.getElementById('coords').textContent =
+    p.latitude.toFixed(6) + ', ' + p.longitude.toFixed(6);
+  document.getElementById('updated').textContent =
+    'Last saved: ' + new Date(p.recorded_at).toLocaleString();
+  document.getElementById('map').hidden = false;
+  document.getElementById('map').src =
+    'https://www.openstreetmap.org/export/embed.html?marker=' +
+    p.latitude + ',' + p.longitude + '&zoom=16';
+}
+</script>
+</body>
+</html>
+sb_publishable_LyhtGMoE2lvZlTjRaB34yw_T_xI6JXv
